@@ -1,0 +1,260 @@
+--- a/base/tsurffSpectrum.hh
++++ b/base/tsurffSpectrum.hh
+@@ -2,6 +2,16 @@
+ #define TSURFF_SPECTRUM_HH
+ 
+ #include <memory>
++#include <chrono>
++#include <stdexcept>
++#include "qprop_linalg.hh"
++#include <gsl/gsl_fft_complex.h>
++#ifdef HAVE_FINUFFT
++#include <finufft.h>
++#endif
++#ifdef HAVE_MPI
++#error "This overlay provides serial extraction only."
++#endif
+ #include <vector>
+ #include <complex>
+ #include <grid.h>
+@@ -188,6 +198,8 @@
+     int i_proc;
+     int num_proc;
+     long  num_k_proc;
++#include "fft_scheme1.inc"
++#include "linear_nufft.inc"
+ public:
+     tsurffSpectrum(const parameterListe &param_ini, const parameterListe &param_prop, const parameterListe &param_tsurff, vx vecpotx, vy vecpoty, vz vecpotz, string filename="tsurff")
+     : thetas_surff(101, 0.0), phis_surff(101, 0.0), k_values(100, 0.0), psi( string("./dat/")+filename+string("_psi.raw"), std::ios::binary ), dpsi_dr( string("./dat/")+filename+string("_dpsidr.raw"), std::ios::binary ), vecpot_x(vecpotx), vecpot_y(vecpoty), vecpot_z(vecpotz) {
+@@ -258,6 +270,7 @@
+     /// call time_integration_ell1_m1_ell2_m2(long, long) \n
+     */
+     void time_integration() {
++        if (use_linear_nufft()) { time_integration_nufft(); return; }
+         long entries_read(0);
+         long all_entries_read(0);
+         long offset(0);
+@@ -267,11 +280,9 @@
+ //       boost::timer tim;
+ // #endif
+             // ell_m_grid_size * cache_size_t entries are read
+-            entries_read=read_psi_data()/ell_m_grid_size;
+-            if      (expansion_scheme==1 && qprop_dim==34)
+-                time_integration_theta_phi(start_t, start_t+entries_read);
+-            else if (expansion_scheme==1 && qprop_dim==44) {
+-                time_integration_theta_phi_ell_m(start_t, start_t+entries_read);
++            entries_read=(expansion_scheme == 1 ? read_fft_psi_data() : read_psi_data())/ell_m_grid_size;
++            if (expansion_scheme == 1) {
++                time_integration_fft(start_t, start_t+entries_read);
+             }
+             else if (expansion_scheme==2 && qprop_dim==34) {
+                 time_integration_ell1_ell2(start_t, start_t+entries_read);
+@@ -309,6 +320,7 @@
+     /// call eval_spectrum_44_ell1_ell2() \n
+     */
+     void polar_spectrum() {
++        if (expansion_scheme == 1) { eval_fft_spectrum(); return; }
+         if (expansion_scheme==1 && qprop_dim==34) {
+             eval_spectrum_34_theta_phi();
+         }
+@@ -475,6 +487,8 @@
+ 
+     /// Allocate space for the time integrals and PES results
+     void prep_space() {
++        if (use_linear_nufft()) { prep_nufft_space(); return; }
++        if (expansion_scheme == 1) { prep_fft_space(); return; }
+         /*
+         // The size of the result after summing over the $\ell$s and $m$s
+         // const long num_spectrum_size_surff=num_k_proc*num_theta_surff*num_phi_surff;
+--- a/attoclock/isurfv.cc
++++ b/attoclock/isurfv.cc
+@@ -8,7 +8,7 @@
+ #include <fluid.h>
+ #include <grid.h>
+ #include <hamop.h>
+-#include <gfunc.h>
++#include "surface_resolvent.hh"
+ #include <smallHelpers.hh>
+ //#include <gsl/gsl_sf_legendre.h>
+ #include <parameter.hh>
+@@ -116,15 +116,13 @@
+     string str_fname_wf=string("./dat/real_prop_wf.dat");
+     FILE* file_wf=fopen_with_check(str_fname_wf, "r");
+     // The wavefunction arrays
+-    wavefunction  wf, wf_load;
+-    wf.init(g.size());
++    wavefunction wf_load;
+     wf_load.init(g_small.size());
+ 
+     wf_load.init(g_small, file_wf, 0, 0);
+     fclose(file_wf);
+ 
+     
+-    wf.regrid(g, g_small, wf_load);
+     // Display the grid parameters
+     if (iv==1) 
+     {
+@@ -139,9 +137,7 @@
+         fflush(stdout);
+     };
+ 
+-    wavefunction staticpot;
+-    staticpot.init(g.size());
+-    staticpot.calculate_staticpot(g, hamilton);
++    SurfaceResolvent resolver(g, g_small, wf_load, nuclear_charge, scalarpotx, imaginarypot, R_surff);
+ 
+     // Output files
+     ofstream file_res(string("./dat/isurfv.dat"));
+@@ -166,7 +162,7 @@
+             energy = i_energy*delta_energy;
+         };
+             
+-        gfunc(psi_at_RI, d_psi_dr_at_RI, energy, staticpot, V_ee_0, nuclear_charge, g, wf, R_surff);
++        resolver.apply(energy, psi_at_RI, d_psi_dr_at_RI);
+ 
+         // write the partial results (i.e., for individual l (and m)) to file
+         file_res << energy << " " << sqrt(2.0*energy) << " " ;
+--- a/long-wavelength/isurfv.cc
++++ b/long-wavelength/isurfv.cc
+@@ -8,7 +8,7 @@
+ #include <fluid.h>
+ #include <grid.h>
+ #include <hamop.h>
+-#include <gfunc.h>
++#include "surface_resolvent.hh"
+ #include <smallHelpers.hh>
+ //#include <gsl/gsl_sf_legendre.h>
+ #include <parameter.hh>
+@@ -116,15 +116,13 @@
+     string str_fname_wf=string("./dat/real_prop_wf.dat");
+     FILE* file_wf=fopen_with_check(str_fname_wf, "r");
+     // The wavefunction arrays
+-    wavefunction  wf, wf_load;
+-    wf.init(g.size());
++    wavefunction wf_load;
+     wf_load.init(g_small.size());
+ 
+     wf_load.init(g_small, file_wf, 0, 0);
+     fclose(file_wf);
+ 
+     
+-    wf.regrid(g, g_small, wf_load);
+     // Display the grid parameters
+     if (iv==1) 
+     {
+@@ -139,9 +137,7 @@
+         fflush(stdout);
+     };
+ 
+-    wavefunction staticpot;
+-    staticpot.init(g.size());
+-    staticpot.calculate_staticpot(g, hamilton);
++    SurfaceResolvent resolver(g, g_small, wf_load, nuclear_charge, scalarpotx, imaginarypot, R_surff);
+ 
+     // Output files
+     ofstream file_res(string("./dat/isurfv.dat"));
+@@ -166,7 +162,7 @@
+             energy = i_energy*delta_energy;
+         };
+             
+-        gfunc(psi_at_RI, d_psi_dr_at_RI, energy, staticpot, V_ee_0, nuclear_charge, g, wf, R_surff);
++        resolver.apply(energy, psi_at_RI, d_psi_dr_at_RI);
+ 
+         // write the partial results (i.e., for individual l (and m)) to file
+         file_res << energy << " " << sqrt(2.0*energy) << " " ;
+--- a/vortex/isurfv.cc
++++ b/vortex/isurfv.cc
+@@ -8,7 +8,7 @@
+ #include <fluid.h>
+ #include <grid.h>
+ #include <hamop.h>
+-#include <gfunc.h>
++#include "surface_resolvent.hh"
+ #include <smallHelpers.hh>
+ //#include <gsl/gsl_sf_legendre.h>
+ #include <parameter.hh>
+@@ -140,15 +140,13 @@
+     string str_fname_wf=string("./dat/real_prop_wf.dat");
+     FILE* file_wf=fopen_with_check(str_fname_wf, "r");
+     // The wavefunction arrays
+-    wavefunction  wf, wf_load;
+-    wf.init(g.size());
++    wavefunction wf_load;
+     wf_load.init(g_small.size());
+ 
+     wf_load.init(g_small, file_wf, 0, 0);
+     fclose(file_wf);
+ 
+     
+-    wf.regrid(g, g_small, wf_load);
+     // Display the grid parameters
+     if (iv==1) 
+     {
+@@ -163,9 +161,7 @@
+         fflush(stdout);
+     };
+ 
+-    wavefunction staticpot;
+-    staticpot.init(g.size());
+-    staticpot.calculate_staticpot(g, hamilton);
++    SurfaceResolvent resolver(g, g_small, wf_load, nuclear_charge, scalarpotx, imaginarypot, R_surff);
+ 
+     // Output files
+     ofstream file_res(string("./dat/isurfv.dat"));
+@@ -190,7 +186,7 @@
+             energy = i_energy*delta_energy;
+         };
+             
+-        gfunc(psi_at_RI, d_psi_dr_at_RI, energy, staticpot, V_ee_0, nuclear_charge, g, wf, R_surff);
++        resolver.apply(energy, psi_at_RI, d_psi_dr_at_RI);
+ 
+         // write the partial results (i.e., for individual l (and m)) to file
+         file_res << energy << " " << sqrt(2.0*energy) << " " ;
+--- a/lissajous/isurfv.cc
++++ b/lissajous/isurfv.cc
+@@ -8,7 +8,7 @@
+ #include <fluid.h>
+ #include <grid.h>
+ #include <hamop.h>
+-#include <gfunc.h>
++#include "surface_resolvent.hh"
+ #include <smallHelpers.hh>
+ //#include <gsl/gsl_sf_legendre.h>
+ #include <parameter.hh>
+@@ -140,15 +140,13 @@
+     string str_fname_wf=string("./dat/real_prop_wf.dat");
+     FILE* file_wf=fopen_with_check(str_fname_wf, "r");
+     // The wavefunction arrays
+-    wavefunction  wf, wf_load;
+-    wf.init(g.size());
++    wavefunction wf_load;
+     wf_load.init(g_small.size());
+ 
+     wf_load.init(g_small, file_wf, 0, 0);
+     fclose(file_wf);
+ 
+     
+-    wf.regrid(g, g_small, wf_load);
+     // Display the grid parameters
+     if (iv==1) 
+     {
+@@ -163,9 +161,7 @@
+         fflush(stdout);
+     };
+ 
+-    wavefunction staticpot;
+-    staticpot.init(g.size());
+-    staticpot.calculate_staticpot(g, hamilton);
++    SurfaceResolvent resolver(g, g_small, wf_load, nuclear_charge, scalarpotx, imaginarypot, R_surff);
+ 
+     // Output files
+     ofstream file_res(string("./dat/isurfv.dat"));
+@@ -190,7 +186,7 @@
+             energy = i_energy*delta_energy;
+         };
+             
+-        gfunc(psi_at_RI, d_psi_dr_at_RI, energy, staticpot, V_ee_0, nuclear_charge, g, wf, R_surff);
++        resolver.apply(energy, psi_at_RI, d_psi_dr_at_RI);
+ 
+         // write the partial results (i.e., for individual l (and m)) to file
+         file_res << energy << " " << sqrt(2.0*energy) << " " ;
